@@ -5,8 +5,10 @@
 use openfang_types::media::{
     MediaAttachment, MediaConfig, MediaSource, MediaType, MediaUnderstanding,
 };
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::Semaphore;
+use tokio::time::{timeout, Duration};
 use tracing::info;
 
 /// Media understanding engine.
@@ -74,6 +76,10 @@ impl MediaEngine {
             )?;
 
         let _permit = self.semaphore.acquire().await.map_err(|e| e.to_string())?;
+
+        if provider == "parakeet-mlx" {
+            return transcribe_with_parakeet_mlx(attachment).await;
+        }
 
         // Derive a proper filename with extension from mime_type
         // (Whisper APIs require an extension to detect format)
@@ -237,6 +243,123 @@ impl MediaEngine {
     }
 }
 
+async fn transcribe_with_parakeet_mlx(
+    attachment: &MediaAttachment,
+) -> Result<MediaUnderstanding, String> {
+    let audio_path = materialize_audio_for_parakeet(attachment).await?;
+
+    let script = r#"
+import json
+import sys
+from parakeet_mlx import from_pretrained
+
+MODEL_ID = "mlx-community/parakeet-tdt-0.6b-v3"
+
+model = from_pretrained(MODEL_ID)
+result = model.transcribe(sys.argv[1])
+print(json.dumps({
+    "text": result.text,
+    "model": MODEL_ID,
+}))
+"#;
+
+    let mut cmd = tokio::process::Command::new("uv");
+    cmd.args([
+        "run",
+        "--with",
+        "parakeet-mlx",
+        "python3",
+        "-c",
+        script,
+        &audio_path.to_string_lossy(),
+    ]);
+    cmd.env("PYTHONUNBUFFERED", "1");
+    cmd.kill_on_drop(true);
+
+    let output = timeout(Duration::from_secs(900), cmd.output())
+        .await
+        .map_err(|_| "parakeet-mlx transcription timed out after 15 minutes".to_string())?
+        .map_err(|e| format!("Failed to launch parakeet-mlx via uv: {e}"))?;
+
+    cleanup_temp_audio(&audio_path, attachment).await;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let detail = if !stderr.trim().is_empty() {
+            stderr.trim()
+        } else {
+            stdout.trim()
+        };
+        return Err(format!("parakeet-mlx transcription failed: {detail}"));
+    }
+
+    let stdout = String::from_utf8(output.stdout)
+        .map_err(|e| format!("parakeet-mlx returned non-UTF8 output: {e}"))?;
+    let parsed: serde_json::Value = serde_json::from_str(stdout.trim())
+        .map_err(|e| format!("Failed to parse parakeet-mlx output: {e}"))?;
+
+    let transcription = parsed["text"]
+        .as_str()
+        .ok_or("parakeet-mlx output missing text field")?
+        .trim()
+        .to_string();
+    if transcription.is_empty() {
+        return Err("parakeet-mlx returned empty transcription".into());
+    }
+
+    let model = parsed["model"]
+        .as_str()
+        .unwrap_or("mlx-community/parakeet-tdt-0.6b-v3");
+
+    Ok(MediaUnderstanding {
+        media_type: MediaType::Audio,
+        description: transcription,
+        provider: "parakeet-mlx".to_string(),
+        model: model.to_string(),
+    })
+}
+
+async fn materialize_audio_for_parakeet(attachment: &MediaAttachment) -> Result<PathBuf, String> {
+    match &attachment.source {
+        MediaSource::FilePath { path } => Ok(PathBuf::from(path)),
+        MediaSource::Base64 { data, mime_type } => {
+            use base64::Engine;
+            let decoded = base64::engine::general_purpose::STANDARD
+                .decode(data)
+                .map_err(|e| format!("Failed to decode base64 audio: {e}"))?;
+            let ext = audio_extension_from_mime(mime_type);
+            let path = std::env::temp_dir()
+                .join(format!("openfang_parakeet_{}.{}", uuid::Uuid::new_v4(), ext));
+            tokio::fs::write(&path, decoded)
+                .await
+                .map_err(|e| format!("Failed to write temp audio file: {e}"))?;
+            Ok(path)
+        }
+        MediaSource::Url { url } => Err(format!(
+            "URL-based audio source not supported for parakeet-mlx transcription: {url}"
+        )),
+    }
+}
+
+async fn cleanup_temp_audio(path: &Path, attachment: &MediaAttachment) {
+    if matches!(attachment.source, MediaSource::Base64 { .. }) {
+        let _ = tokio::fs::remove_file(path).await;
+    }
+}
+
+fn audio_extension_from_mime(mime_type: &str) -> &'static str {
+    match mime_type {
+        "audio/wav" | "audio/x-wav" => "wav",
+        "audio/mpeg" | "audio/mp3" => "mp3",
+        "audio/ogg" => "ogg",
+        "audio/webm" => "webm",
+        "audio/mp4" | "audio/m4a" => "m4a",
+        "audio/flac" => "flac",
+        _ => "wav",
+    }
+}
+
 /// Detect which vision provider is available based on environment variables.
 fn detect_vision_provider() -> Option<&'static str> {
     if std::env::var("ANTHROPIC_API_KEY").is_ok() {
@@ -253,6 +376,15 @@ fn detect_vision_provider() -> Option<&'static str> {
 
 /// Detect which audio transcription provider is available.
 fn detect_audio_provider() -> Option<&'static str> {
+    if std::env::var("OPENFANG_ENABLE_PARAKEET_MLX").is_ok()
+        || std::process::Command::new("uv")
+            .arg("--version")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+    {
+        return Some("parakeet-mlx");
+    }
     if std::env::var("GROQ_API_KEY").is_ok() {
         return Some("groq");
     }
@@ -275,6 +407,7 @@ fn default_vision_model(provider: &str) -> &str {
 /// Get the default audio model for a provider.
 fn default_audio_model(provider: &str) -> &str {
     match provider {
+        "parakeet-mlx" => "mlx-community/parakeet-tdt-0.6b-v3",
         "groq" => "whisper-large-v3-turbo",
         "openai" => "whisper-1",
         _ => "unknown",
@@ -405,6 +538,10 @@ mod tests {
 
     #[test]
     fn test_default_audio_models() {
+        assert_eq!(
+            default_audio_model("parakeet-mlx"),
+            "mlx-community/parakeet-tdt-0.6b-v3"
+        );
         assert_eq!(default_audio_model("groq"), "whisper-large-v3-turbo");
         assert_eq!(default_audio_model("openai"), "whisper-1");
     }

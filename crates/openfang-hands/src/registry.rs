@@ -555,6 +555,10 @@ fn check_chromium_available() -> bool {
 
 /// Check if a binary is on PATH (cross-platform).
 fn which_binary(name: &str) -> bool {
+    if name == "parakeet-mlx" {
+        return which_binary("uv");
+    }
+
     let path_var = std::env::var("PATH").unwrap_or_default();
     let separator = if cfg!(windows) { ';' } else { ':' };
     let extensions: Vec<&str> = if cfg!(windows) {
@@ -859,5 +863,10 @@ mod tests {
             install: None,
         };
         assert!(!req.optional);
+    }
+
+    #[test]
+    fn parakeet_mlx_option_uses_uv() {
+        assert_eq!(which_binary("parakeet-mlx"), which_binary("uv"));
     }
 }
