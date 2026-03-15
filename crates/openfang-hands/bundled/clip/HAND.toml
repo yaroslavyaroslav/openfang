@@ -68,6 +68,11 @@ value = "auto"
 label = "Auto-detect (best available)"
 
 [[settings.options]]
+value = "parakeet_mlx"
+label = "Parakeet MLX (local)"
+binary = "parakeet-mlx"
+
+[[settings.options]]
 value = "whisper_local"
 label = "Local Whisper"
 binary = "whisper"
@@ -310,7 +315,14 @@ curl -s -X POST "https://api.deepgram.com/v1/listen?model=nova-2&smart_format=tr
 ```
 Parse `results.channels[0].alternatives[0].words` for word-level timing.
 
-### Path E: Local Whisper (stt_provider = whisper_local or auto fallback)
+### Path E: Parakeet MLX local pipeline (stt_provider = parakeet_mlx)
+```
+ffmpeg -i source.mp4 -vn -ar 16000 -ac 1 -y audio.wav
+uv run --with parakeet-mlx python3 -c "from parakeet_mlx import from_pretrained; import json, sys; model = from_pretrained('mlx-community/parakeet-tdt-0.6b-v3'); result = model.transcribe(sys.argv[1]); print(json.dumps({'text': result.text}))" audio.wav
+```
+This produces JSON output with the transcript text using the local MLX model.
+
+### Path F: Local Whisper (stt_provider = whisper_local or auto fallback)
 ```
 ffmpeg -i source.mp4 -vn -ar 16000 -ac 1 -y audio.wav
 whisper audio.wav --model small --output_format json --word_timestamps true --language en
@@ -318,7 +330,7 @@ whisper audio.wav --model small --output_format json --word_timestamps true --la
 This produces `audio.json` with segments containing word-level timing.
 If `whisper` is not found, try `whisper-ctranslate2` (same flags, 4x faster).
 
-### Path F: No subtitles, no STT (fallback)
+### Path G: No subtitles, no STT (fallback)
 Fall back to ffmpeg scene detection + silence detection.
 
 Scene detection — run ffmpeg and look for `pts_time:` values in the output:

@@ -341,7 +341,13 @@ print(json.dumps({"text": result.text, "model": "mlx-community/parakeet-tdt-0.6b
 /// Detect which audio transcription provider is available.
 fn detect_audio_provider() -> Option<&'static str> {
     // Explicit opt-in for local Parakeet MLX transcription
-    if std::env::var("OPENFANG_ENABLE_PARAKEET_MLX").is_ok() {
+    if std::env::var("OPENFANG_ENABLE_PARAKEET_MLX").is_ok()
+        || std::process::Command::new("uv")
+            .arg("--version")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+    {
         return Some("parakeet-mlx");
     }
     if std::env::var("GROQ_API_KEY").is_ok() {
@@ -497,6 +503,7 @@ mod tests {
 
     #[test]
     fn test_default_audio_models() {
+        assert_eq!(default_audio_model("parakeet-mlx"), "mlx-community/parakeet-tdt-0.6b-v3");
         assert_eq!(default_audio_model("groq"), "whisper-large-v3-turbo");
         assert_eq!(default_audio_model("openai"), "whisper-1");
     }
