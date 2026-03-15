@@ -106,6 +106,18 @@ impl TelegramAdapter {
         text: &str,
         thread_id: Option<i64>,
     ) -> Result<(), Box<dyn std::error::Error>> {
+        self.api_send_message_with_options(chat_id, text, thread_id, true, None)
+            .await
+    }
+
+    async fn api_send_message_with_options(
+        &self,
+        chat_id: i64,
+        text: &str,
+        thread_id: Option<i64>,
+        use_html: bool,
+        reply_markup: Option<serde_json::Value>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
         let url = format!(
             "{}/bot{}/sendMessage",
             self.api_base_url,
@@ -123,10 +135,15 @@ impl TelegramAdapter {
             let mut body = serde_json::json!({
                 "chat_id": chat_id,
                 "text": chunk,
-                "parse_mode": "HTML",
             });
+            if use_html {
+                body["parse_mode"] = serde_json::json!("HTML");
+            }
             if let Some(tid) = thread_id {
                 body["message_thread_id"] = serde_json::json!(tid);
+            }
+            if let Some(markup) = reply_markup.clone() {
+                body["reply_markup"] = markup;
             }
 
             let resp = self.client.post(&url).json(&body).send().await?;
@@ -471,7 +488,7 @@ impl ChannelAdapter for TelegramAdapter {
                 let url = format!("{}/bot{}/getUpdates", api_base_url, token.as_str());
                 let mut params = serde_json::json!({
                     "timeout": LONG_POLL_TIMEOUT,
-                    "allowed_updates": ["message", "edited_message"],
+                    "allowed_updates": ["message", "edited_message", "callback_query"],
                 });
                 if let Some(off) = offset {
                     params["offset"] = serde_json::json!(off);
@@ -638,6 +655,30 @@ impl ChannelAdapter for TelegramAdapter {
         Ok(())
     }
 
+    async fn send_approval_prompt(
+        &self,
+        user: &ChannelUser,
+        text: &str,
+        approve_id: &str,
+        reject_id: &str,
+        thread_id: Option<&str>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let chat_id: i64 = user
+            .platform_id
+            .parse()
+            .map_err(|_| format!("Invalid Telegram chat_id: {}", user.platform_id))?;
+        let tid = thread_id.and_then(|id| id.parse::<i64>().ok());
+        let markup = serde_json::json!({
+            "inline_keyboard": [[
+                { "text": "Approve", "callback_data": format!("approve:{approve_id}") },
+                { "text": "Reject", "callback_data": format!("reject:{reject_id}") }
+            ]]
+        });
+
+        self.api_send_message_with_options(chat_id, text, tid, false, Some(markup))
+            .await
+    }
+
     async fn stop(&self) -> Result<(), Box<dyn std::error::Error>> {
         let _ = self.shutdown_tx.send(true);
         Ok(())
@@ -679,6 +720,69 @@ async fn parse_telegram_update(
     bot_username: Option<&str>,
 ) -> Option<ChannelMessage> {
     let update_id = update["update_id"].as_i64().unwrap_or(0);
+    if let Some(callback) = update.get("callback_query") {
+        let from = callback.get("from")?;
+        let user_id = from["id"].as_i64()?;
+        let user_id_str = user_id.to_string();
+        if !allowed_users.is_empty() && !allowed_users.iter().any(|u| u == &user_id_str) {
+            debug!("Telegram: ignoring callback from unlisted user {user_id}");
+            return None;
+        }
+
+        let data = callback["data"].as_str()?;
+        let (name, id) = if let Some(id) = data.strip_prefix("approve:") {
+            ("approve", id.to_string())
+        } else if let Some(id) = data.strip_prefix("reject:") {
+            ("reject", id.to_string())
+        } else {
+            debug!("Telegram: dropping callback update {update_id} — unsupported payload");
+            return None;
+        };
+
+        if let Some(callback_id) = callback["id"].as_str() {
+            let answer_url = format!("{api_base_url}/bot{token}/answerCallbackQuery");
+            let _ = client
+                .post(&answer_url)
+                .json(&serde_json::json!({ "callback_query_id": callback_id }))
+                .send()
+                .await;
+        }
+
+        let message = callback.get("message")?;
+        let chat_id = message["chat"]["id"].as_i64()?;
+        let chat_type = message["chat"]["type"].as_str().unwrap_or("private");
+        let is_group = chat_type == "group" || chat_type == "supergroup";
+        let message_id = message["message_id"].as_i64().unwrap_or(0);
+        let first_name = from["first_name"].as_str().unwrap_or("Unknown");
+        let last_name = from["last_name"].as_str().unwrap_or("");
+        let display_name = if last_name.is_empty() {
+            first_name.to_string()
+        } else {
+            format!("{first_name} {last_name}")
+        };
+
+        return Some(ChannelMessage {
+            channel: ChannelType::Telegram,
+            platform_message_id: message_id.to_string(),
+            sender: ChannelUser {
+                platform_id: chat_id.to_string(),
+                display_name,
+                openfang_user: None,
+            },
+            content: ChannelContent::Command {
+                name: name.to_string(),
+                args: vec![id],
+            },
+            target_agent: None,
+            timestamp: chrono::Utc::now(),
+            is_group,
+            thread_id: message["message_thread_id"]
+                .as_i64()
+                .map(|tid| tid.to_string()),
+            metadata: HashMap::new(),
+        });
+    }
+
     let message = match update.get("message").or_else(|| update.get("edited_message")) {
         Some(m) => m,
         None => {
@@ -1052,6 +1156,41 @@ mod tests {
             ChannelContent::Command { name, args } => {
                 assert_eq!(name, "agent");
                 assert_eq!(args, &["hello-world"]);
+            }
+            other => panic!("Expected Command, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_parse_telegram_callback_query_approve() {
+        let update = serde_json::json!({
+            "update_id": 123459,
+            "callback_query": {
+                "id": "cbq-1",
+                "from": {
+                    "id": 111222333,
+                    "first_name": "Alice"
+                },
+                "data": "approve:abc12345",
+                "message": {
+                    "message_id": 44,
+                    "chat": {
+                        "id": 111222333,
+                        "type": "private"
+                    },
+                    "date": 1700000002
+                }
+            }
+        });
+
+        let client = test_client();
+        let msg = parse_telegram_update(&update, &[], "fake:token", &client, DEFAULT_API_URL, None)
+            .await
+            .unwrap();
+        match &msg.content {
+            ChannelContent::Command { name, args } => {
+                assert_eq!(name, "approve");
+                assert_eq!(args, &["abc12345"]);
             }
             other => panic!("Expected Command, got {other:?}"),
         }

@@ -14,7 +14,10 @@ use dashmap::DashMap;
 use openfang_types::message::ContentBlock;
 use futures::StreamExt;
 use openfang_types::agent::AgentId;
+use openfang_types::approval::ApprovalRequest;
 use openfang_types::config::{ChannelOverrides, DmPolicy, GroupPolicy, OutputFormat};
+use std::collections::HashSet;
+use std::future::Future;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::watch;
@@ -206,6 +209,11 @@ pub trait ChannelBridgeHandle: Send + Sync {
     /// Approve or reject a pending approval by UUID prefix.
     async fn resolve_approval_text(&self, _id_prefix: &str, _approve: bool) -> String {
         "Approvals not available.".to_string()
+    }
+
+    /// List pending approvals for a specific agent.
+    async fn pending_approvals_for_agent(&self, _agent_id: AgentId) -> Vec<ApprovalRequest> {
+        Vec::new()
     }
 
     // ── Budget, Network, A2A ──
@@ -438,6 +446,60 @@ async fn send_lifecycle_reaction(
         remove_previous: true,
     };
     let _ = adapter.send_reaction(user, message_id, &reaction).await;
+}
+
+fn format_approval_prompt(req: &ApprovalRequest) -> (String, String) {
+    let id = req.id.to_string();
+    let id_short = openfang_types::truncate_str(&id, 8).to_string();
+    let mut msg = format!(
+        "{} Approval needed\nTool: {}\nRisk: {:?}\nID: {}\n",
+        req.risk_level.emoji(),
+        req.tool_name,
+        req.risk_level,
+        id_short,
+    );
+    if !req.action_summary.is_empty() {
+        msg.push_str(&format!("Action: {}\n", req.action_summary));
+    } else if !req.description.is_empty() {
+        msg.push_str(&format!("Action: {}\n", req.description));
+    }
+    (msg, id_short)
+}
+
+async fn await_agent_response_with_approval_prompts<F>(
+    future: F,
+    agent_id: AgentId,
+    handle: &Arc<dyn ChannelBridgeHandle>,
+    adapter: &dyn ChannelAdapter,
+    user: &ChannelUser,
+    thread_id: Option<&str>,
+) -> Result<String, String>
+where
+    F: Future<Output = Result<String, String>>,
+{
+    let mut announced = HashSet::new();
+    tokio::pin!(future);
+
+    loop {
+        tokio::select! {
+            result = &mut future => return result,
+            _ = tokio::time::sleep(Duration::from_millis(500)) => {
+                for req in handle.pending_approvals_for_agent(agent_id).await {
+                    let id = req.id.to_string();
+                    if !announced.insert(id.clone()) {
+                        continue;
+                    }
+                    let (text, _) = format_approval_prompt(&req);
+                    if let Err(e) = adapter
+                        .send_approval_prompt(user, &text, &id, &id, thread_id)
+                        .await
+                    {
+                        warn!("Failed to send approval prompt to channel: {e}");
+                    }
+                }
+            }
+        }
+    }
 }
 
 /// Spawn a background task that refreshes the typing indicator every 4 seconds.
@@ -812,7 +874,15 @@ async fn dispatch_message(
     let typing_task = spawn_typing_loop(adapter_arc.clone(), message.sender.clone());
 
     // Send to agent and relay response
-    let result = handle.send_message(agent_id, &text).await;
+    let result = await_agent_response_with_approval_prompts(
+        handle.send_message(agent_id, &text),
+        agent_id,
+        handle,
+        adapter,
+        &message.sender,
+        thread_id,
+    )
+    .await;
 
     // Stop the typing refresh now that we have a response
     typing_task.abort();
@@ -1125,7 +1195,15 @@ async fn dispatch_with_blocks(
     // Continuous typing indicator (see spawn_typing_loop doc)
     let typing_task = spawn_typing_loop(adapter_arc.clone(), message.sender.clone());
 
-    let result = handle.send_message_with_blocks(agent_id, blocks).await;
+    let result = await_agent_response_with_approval_prompts(
+        handle.send_message_with_blocks(agent_id, blocks),
+        agent_id,
+        handle,
+        adapter,
+        &message.sender,
+        thread_id,
+    )
+    .await;
 
     typing_task.abort();
 

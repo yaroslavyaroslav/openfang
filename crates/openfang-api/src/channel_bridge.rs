@@ -52,6 +52,7 @@ use openfang_channels::ntfy::NtfyAdapter;
 use openfang_channels::webhook::WebhookAdapter;
 use openfang_kernel::OpenFangKernel;
 use openfang_types::agent::AgentId;
+use openfang_types::approval::ApprovalRequest;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tracing::{error, info, warn};
@@ -668,6 +669,16 @@ impl ChannelBridgeHandle for KernelBridgeAdapter {
             }
             n => format!("{n} approvals match '{id_prefix}'. Be more specific."),
         }
+    }
+
+    async fn pending_approvals_for_agent(&self, agent_id: AgentId) -> Vec<ApprovalRequest> {
+        let agent_id = agent_id.to_string();
+        self.kernel
+            .approval_manager
+            .list_pending()
+            .into_iter()
+            .filter(|req| req.agent_id == agent_id)
+            .collect()
     }
 
     async fn reset_session(&self, agent_id: AgentId) -> Result<String, String> {
