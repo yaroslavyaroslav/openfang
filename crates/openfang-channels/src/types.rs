@@ -269,6 +269,26 @@ pub trait ChannelAdapter: Send + Sync {
         self.send(user, content).await
     }
 
+    /// Send an approval prompt with approve/reject actions when the platform supports it.
+    ///
+    /// Default implementation falls back to a plain text message without buttons.
+    async fn send_approval_prompt(
+        &self,
+        user: &ChannelUser,
+        text: &str,
+        approve_id: &str,
+        reject_id: &str,
+        thread_id: Option<&str>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let fallback = format!("{text}\n\nUse /approve {approve_id} or /reject {reject_id}");
+        let content = ChannelContent::Text(fallback);
+        if let Some(tid) = thread_id {
+            self.send_in_thread(user, content, tid).await
+        } else {
+            self.send(user, content).await
+        }
+    }
+
     /// Whether this adapter should suppress sending internal agent errors back to the user.
     ///
     /// Returns `true` for public broadcast channels (e.g. Mastodon) where posting

@@ -54,6 +54,8 @@ use openfang_channels::webhook::WebhookAdapter;
 use openfang_channels::wecom::WeComAdapter;
 use openfang_kernel::OpenFangKernel;
 use openfang_types::agent::AgentId;
+use openfang_types::approval::ApprovalRequest;
+use openfang_types::media::{MediaAttachment, MediaSource, MediaType};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tracing::{error, info, warn};
@@ -106,6 +108,34 @@ impl ChannelBridgeHandle for KernelBridgeAdapter {
             .await
             .map_err(|e| format!("{e}"))?;
         Ok(result.response)
+    }
+
+    async fn transcribe_audio(
+        &self,
+        audio_bytes: Vec<u8>,
+        mime_type: &str,
+    ) -> Result<String, String> {
+        use base64::Engine;
+
+        let size_bytes = audio_bytes.len() as u64;
+        let encoded = base64::engine::general_purpose::STANDARD.encode(audio_bytes);
+        let attachment = MediaAttachment {
+            media_type: MediaType::Audio,
+            mime_type: mime_type.to_string(),
+            source: MediaSource::Base64 {
+                data: encoded,
+                mime_type: mime_type.to_string(),
+            },
+            size_bytes,
+        };
+
+        let result = self
+            .kernel
+            .media_engine
+            .transcribe_audio(&attachment)
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(result.description)
     }
 
     async fn find_agent_by_name(&self, name: &str) -> Result<Option<AgentId>, String> {
@@ -678,6 +708,16 @@ impl ChannelBridgeHandle for KernelBridgeAdapter {
             }
             n => format!("{n} approvals match '{id_prefix}'. Be more specific."),
         }
+    }
+
+    async fn pending_approvals_for_agent(&self, agent_id: AgentId) -> Vec<ApprovalRequest> {
+        let agent_id = agent_id.to_string();
+        self.kernel
+            .approval_manager
+            .list_pending()
+            .into_iter()
+            .filter(|req| req.agent_id == agent_id)
+            .collect()
     }
 
     async fn reset_session(&self, agent_id: AgentId) -> Result<String, String> {

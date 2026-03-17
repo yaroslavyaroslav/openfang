@@ -13,8 +13,11 @@ use async_trait::async_trait;
 use dashmap::DashMap;
 use futures::StreamExt;
 use openfang_types::agent::AgentId;
+use openfang_types::approval::ApprovalRequest;
 use openfang_types::config::{ChannelOverrides, DmPolicy, GroupPolicy, OutputFormat};
 use openfang_types::message::ContentBlock;
+use std::collections::HashSet;
+use std::future::Future;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::watch;
@@ -47,6 +50,15 @@ pub trait ChannelBridgeHandle: Send + Sync {
             .collect::<Vec<_>>()
             .join("\n");
         self.send_message(agent_id, &text).await
+    }
+
+    /// Transcribe raw audio bytes into text.
+    async fn transcribe_audio(
+        &self,
+        _audio_bytes: Vec<u8>,
+        _mime_type: &str,
+    ) -> Result<String, String> {
+        Err("Audio transcription not available.".to_string())
     }
 
     /// Find an agent by name, returning its ID.
@@ -206,6 +218,11 @@ pub trait ChannelBridgeHandle: Send + Sync {
     /// Approve or reject a pending approval by UUID prefix.
     async fn resolve_approval_text(&self, _id_prefix: &str, _approve: bool) -> String {
         "Approvals not available.".to_string()
+    }
+
+    /// List pending approvals for a specific agent.
+    async fn pending_approvals_for_agent(&self, _agent_id: AgentId) -> Vec<ApprovalRequest> {
+        Vec::new()
     }
 
     // ── Budget, Network, A2A ──
@@ -453,6 +470,60 @@ async fn send_lifecycle_reaction(
     let _ = adapter.send_reaction(user, message_id, &reaction).await;
 }
 
+fn format_approval_prompt(req: &ApprovalRequest) -> (String, String) {
+    let id = req.id.to_string();
+    let id_short = openfang_types::truncate_str(&id, 8).to_string();
+    let mut msg = format!(
+        "{} Approval needed\nTool: {}\nRisk: {:?}\nID: {}\n",
+        req.risk_level.emoji(),
+        req.tool_name,
+        req.risk_level,
+        id_short,
+    );
+    if !req.action_summary.is_empty() {
+        msg.push_str(&format!("Action: {}\n", req.action_summary));
+    } else if !req.description.is_empty() {
+        msg.push_str(&format!("Action: {}\n", req.description));
+    }
+    (msg, id_short)
+}
+
+async fn await_agent_response_with_approval_prompts<F>(
+    future: F,
+    agent_id: AgentId,
+    handle: &Arc<dyn ChannelBridgeHandle>,
+    adapter: &dyn ChannelAdapter,
+    user: &ChannelUser,
+    thread_id: Option<&str>,
+) -> Result<String, String>
+where
+    F: Future<Output = Result<String, String>>,
+{
+    let mut announced = HashSet::new();
+    tokio::pin!(future);
+
+    loop {
+        tokio::select! {
+            result = &mut future => return result,
+            _ = tokio::time::sleep(Duration::from_millis(500)) => {
+                for req in handle.pending_approvals_for_agent(agent_id).await {
+                    let id = req.id.to_string();
+                    if !announced.insert(id.clone()) {
+                        continue;
+                    }
+                    let (text, _) = format_approval_prompt(&req);
+                    if let Err(e) = adapter
+                        .send_approval_prompt(user, &text, &id, &id, thread_id)
+                        .await
+                    {
+                        warn!("Failed to send approval prompt to channel: {e}");
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// Spawn a background task that refreshes the typing indicator every 4 seconds.
 ///
 /// Returns a `JoinHandle` that should be aborted once the LLM call completes.
@@ -672,9 +743,15 @@ async fn dispatch_message(
         ChannelContent::Voice {
             ref url,
             duration_seconds,
-        } => {
-            format!("[User sent a voice message ({duration_seconds}s): {url}]")
-        }
+        } => match transcribe_voice_message(url, handle).await {
+            Ok(transcript) => format!(
+                "User sent a voice message ({duration_seconds}s). Transcript:\n{transcript}"
+            ),
+            Err(err) => {
+                warn!("Voice transcription failed, falling back to URL: {err}");
+                format!("[User sent a voice message ({duration_seconds}s): {url}]")
+            }
+        },
         ChannelContent::Location { lat, lon } => {
             format!("[User shared location: {lat}, {lon}]")
         }
@@ -891,7 +968,15 @@ async fn dispatch_message(
     let typing_task = spawn_typing_loop(adapter_arc.clone(), message.sender.clone());
 
     // Send to agent and relay response
-    let result = handle.send_message(agent_id, &text).await;
+    let result = await_agent_response_with_approval_prompts(
+        handle.send_message(agent_id, &text),
+        agent_id,
+        handle,
+        adapter,
+        &message.sender,
+        thread_id,
+    )
+    .await;
 
     // Stop the typing refresh now that we have a response
     typing_task.abort();
@@ -955,11 +1040,13 @@ async fn dispatch_message(
                         }
                         warn!("Agent error after re-resolution for {new_id}: {e2}");
                         let err_msg = sanitize_agent_error(&e2.to_string());
+                        let response_text = fallback_channel_error_response(message, "", &err_msg)
+                            .unwrap_or_else(|| err_msg.clone());
                         if !adapter.suppress_error_responses() {
                             send_response(
                                 adapter,
                                 &message.sender,
-                                err_msg.clone(),
+                                response_text,
                                 thread_id,
                                 output_format,
                             )
@@ -985,11 +1072,13 @@ async fn dispatch_message(
             }
             warn!("Agent error for {agent_id}: {e}");
             let err_msg = sanitize_agent_error(&e.to_string());
+            let response_text = fallback_channel_error_response(message, "", &err_msg)
+                .unwrap_or_else(|| err_msg.clone());
             if !adapter.suppress_error_responses() {
                 send_response(
                     adapter,
                     &message.sender,
-                    err_msg.clone(),
+                    response_text,
                     thread_id,
                     output_format,
                 )
@@ -1077,6 +1166,144 @@ fn sanitize_agent_error(raw: &str) -> String {
     }
 
     format!("Agent error: {cleaned}")
+}
+
+fn fallback_channel_error_response(
+    message: &ChannelMessage,
+    dispatch_text: &str,
+    agent_error: &str,
+) -> Option<String> {
+    match &message.content {
+        ChannelContent::Voice { .. } => extract_voice_transcript(dispatch_text).map(|transcript| {
+            format!(
+                "Voice transcription completed, but the agent reply failed.\n\nTranscript:\n{transcript}\n\nAgent error: {agent_error}"
+            )
+        }),
+        _ => None,
+    }
+}
+
+fn extract_voice_transcript(dispatch_text: &str) -> Option<&str> {
+    let marker = "Transcript:\n";
+    let idx = dispatch_text.find(marker)?;
+    let transcript = dispatch_text[idx + marker.len()..].trim();
+    if transcript.is_empty() {
+        None
+    } else {
+        Some(transcript)
+    }
+}
+
+async fn transcribe_voice_message(
+    url: &str,
+    handle: &Arc<dyn ChannelBridgeHandle>,
+) -> Result<String, String> {
+    const MAX_AUDIO_BYTES: usize = 20 * 1024 * 1024;
+
+    let client = reqwest::Client::new();
+    let resp = client
+        .get(url)
+        .send()
+        .await
+        .map_err(|e| format!("Failed to download voice message: {e}"))?;
+
+    if !resp.status().is_success() {
+        return Err(format!(
+            "Voice message download failed with status {}",
+            resp.status()
+        ));
+    }
+
+    let header_mime = resp
+        .headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .map(|ct| ct.split(';').next().unwrap_or(ct).trim().to_string());
+
+    let bytes = resp
+        .bytes()
+        .await
+        .map_err(|e| format!("Failed to read voice message bytes: {e}"))?;
+
+    if bytes.len() > MAX_AUDIO_BYTES {
+        return Err(format!(
+            "Voice message too large for transcription: {} bytes",
+            bytes.len()
+        ));
+    }
+
+    let mime_type = detect_audio_mime_type(&bytes, header_mime.as_deref(), url).to_string();
+    let transcript = handle.transcribe_audio(bytes.to_vec(), &mime_type).await?;
+    let transcript = transcript.trim().to_string();
+    if transcript.is_empty() {
+        return Err("Voice transcription returned empty text".to_string());
+    }
+    Ok(transcript)
+}
+
+fn detect_audio_mime_type(bytes: &[u8], header_mime: Option<&str>, url: &str) -> &'static str {
+    if let Some(mime) = header_mime {
+        let normalized = mime.trim().to_ascii_lowercase();
+        if normalized.starts_with("audio/") {
+            return audio_mime_alias(&normalized);
+        }
+    }
+
+    if bytes.starts_with(b"OggS") {
+        return "audio/ogg";
+    }
+    if bytes.starts_with(b"fLaC") {
+        return "audio/flac";
+    }
+    if bytes.starts_with(b"RIFF") && bytes.get(8..12) == Some(b"WAVE") {
+        return "audio/wav";
+    }
+    if bytes.starts_with(b"ID3")
+        || bytes.starts_with(&[0xFF, 0xFB])
+        || bytes.starts_with(&[0xFF, 0xF3])
+        || bytes.starts_with(&[0xFF, 0xF2])
+    {
+        return "audio/mpeg";
+    }
+    if bytes.starts_with(&[0x1A, 0x45, 0xDF, 0xA3]) {
+        return "audio/webm";
+    }
+    if bytes.len() > 8 && bytes.get(4..8) == Some(b"ftyp") {
+        return "audio/mp4";
+    }
+
+    infer_audio_mime_type(url)
+}
+
+fn infer_audio_mime_type(url: &str) -> &'static str {
+    let lower = url.to_ascii_lowercase();
+    if lower.ends_with(".ogg") || lower.ends_with(".oga") || lower.ends_with(".opus") {
+        "audio/ogg"
+    } else if lower.ends_with(".mp3") {
+        "audio/mpeg"
+    } else if lower.ends_with(".wav") {
+        "audio/wav"
+    } else if lower.ends_with(".flac") {
+        "audio/flac"
+    } else if lower.ends_with(".webm") {
+        "audio/webm"
+    } else if lower.ends_with(".m4a") || lower.ends_with(".mp4") {
+        "audio/mp4"
+    } else {
+        "audio/ogg"
+    }
+}
+
+fn audio_mime_alias(mime: &str) -> &'static str {
+    match mime {
+        "audio/ogg" | "application/ogg" | "audio/opus" | "audio/oga" => "audio/ogg",
+        "audio/mpeg" | "audio/mp3" => "audio/mpeg",
+        "audio/wav" | "audio/x-wav" | "audio/wave" => "audio/wav",
+        "audio/flac" | "audio/x-flac" => "audio/flac",
+        "audio/webm" => "audio/webm",
+        "audio/mp4" | "audio/m4a" | "audio/x-m4a" => "audio/mp4",
+        _ => "audio/ogg",
+    }
 }
 
 /// Detect image format from the first few magic bytes.
@@ -1287,9 +1514,15 @@ async fn dispatch_with_blocks(
     // Continuous typing indicator (see spawn_typing_loop doc)
     let typing_task = spawn_typing_loop(adapter_arc.clone(), message.sender.clone());
 
-    let result = handle
-        .send_message_with_blocks(agent_id, blocks.clone())
-        .await;
+    let result = await_agent_response_with_approval_prompts(
+        handle.send_message_with_blocks(agent_id, blocks.clone()),
+        agent_id,
+        handle,
+        adapter,
+        &message.sender,
+        thread_id,
+    )
+    .await;
 
     typing_task.abort();
 
@@ -1352,11 +1585,13 @@ async fn dispatch_with_blocks(
                         }
                         warn!("Agent error after re-resolution for {new_id}: {e2}");
                         let err_msg = sanitize_agent_error(&e2.to_string());
+                        let response_text = fallback_channel_error_response(message, "", &err_msg)
+                            .unwrap_or_else(|| err_msg.clone());
                         if !adapter.suppress_error_responses() {
                             send_response(
                                 adapter,
                                 &message.sender,
-                                err_msg.clone(),
+                                response_text,
                                 thread_id,
                                 output_format,
                             )
@@ -1382,11 +1617,13 @@ async fn dispatch_with_blocks(
             }
             warn!("Agent error for {agent_id}: {e}");
             let err_msg = sanitize_agent_error(&e.to_string());
+            let response_text = fallback_channel_error_response(message, "", &err_msg)
+                .unwrap_or_else(|| err_msg.clone());
             if !adapter.suppress_error_responses() {
                 send_response(
                     adapter,
                     &message.sender,
-                    err_msg.clone(),
+                    response_text,
                     thread_id,
                     output_format,
                 )
@@ -1913,6 +2150,98 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(result, "Echo: ");
+    }
+
+    #[tokio::test]
+    async fn test_transcribe_voice_message() {
+        use axum::{routing::get, Router};
+
+        struct VoiceHandle;
+
+        #[async_trait]
+        impl ChannelBridgeHandle for VoiceHandle {
+            async fn send_message(
+                &self,
+                _agent_id: AgentId,
+                _message: &str,
+            ) -> Result<String, String> {
+                Ok(String::new())
+            }
+
+            async fn transcribe_audio(
+                &self,
+                _audio_bytes: Vec<u8>,
+                _mime_type: &str,
+            ) -> Result<String, String> {
+                Ok("mock transcript".to_string())
+            }
+
+            async fn find_agent_by_name(&self, _name: &str) -> Result<Option<AgentId>, String> {
+                Ok(None)
+            }
+
+            async fn list_agents(&self) -> Result<Vec<(AgentId, String)>, String> {
+                Ok(vec![])
+            }
+
+            async fn spawn_agent_by_name(
+                &self,
+                _manifest_name: &str,
+            ) -> Result<AgentId, String> {
+                Err("spawn not implemented".to_string())
+            }
+        }
+
+        let handle: Arc<dyn ChannelBridgeHandle> = Arc::new(VoiceHandle);
+        let app = Router::new().route(
+            "/voice.ogg",
+            get(|| async {
+                (
+                    [(axum::http::header::CONTENT_TYPE, "audio/ogg")],
+                    vec![0_u8, 1, 2, 3],
+                )
+            }),
+        );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let transcript = transcribe_voice_message(&format!("http://{addr}/voice.ogg"), &handle)
+            .await
+            .unwrap();
+        assert_eq!(transcript, "mock transcript");
+
+        server.abort();
+    }
+
+    #[test]
+    fn test_extract_voice_transcript() {
+        let dispatch = "User sent a voice message (7s). Transcript:\nmock transcript";
+        assert_eq!(extract_voice_transcript(dispatch), Some("mock transcript"));
+        assert_eq!(extract_voice_transcript("plain text"), None);
+    }
+
+    #[test]
+    fn test_detect_audio_mime_type_prefers_audio_header() {
+        assert_eq!(
+            detect_audio_mime_type(b"OggSdata", Some("audio/ogg"), "https://example.com/file"),
+            "audio/ogg"
+        );
+    }
+
+    #[test]
+    fn test_detect_audio_mime_type_uses_magic_bytes_when_header_is_octet_stream() {
+        assert_eq!(
+            detect_audio_mime_type(
+                b"OggSrest",
+                Some("application/octet-stream"),
+                "https://example.com/file"
+            ),
+            "audio/ogg"
+        );
     }
 
     #[test]
